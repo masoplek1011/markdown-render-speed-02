@@ -603,7 +603,9 @@ function tokCode(st, src, pos) {
   const raw = trimTrailingBlankLines(cap[0]);
   return {
     token: { type: 'code', raw, text: raw.replace(O.codeRemoveIndent, '') },
-    pos: pos + cap[0].length,
+    // Advance by the trimmed raw, as marked's Lexer does: the newlines the
+    // trim dropped stay in the source and become a space token.
+    pos: pos + raw.length,
   };
 }
 
@@ -629,19 +631,21 @@ function tokHeading(st, src, pos) {
     const trimmed = rtrim(text, '#');
     if (!trimmed || O.endingSpaceTabChar.test(trimmed)) text = trimmed.trim();
   }
+  const raw = rtrim(cap[0], '\n');
   return {
     token: {
-      type: 'heading', raw: rtrim(cap[0], '\n'), depth: cap[1].length,
+      type: 'heading', raw, depth: cap[1].length,
       text, tokens: queueInline(st, text),
     },
-    pos: pos + cap[0].length,
+    pos: pos + raw.length,
   };
 }
 
 function tokHr(st, src, pos) {
   const cap = at(BLOCK.hr, src, pos);
   if (!cap) return;
-  return { token: { type: 'hr', raw: rtrim(cap[0], '\n') }, pos: pos + cap[0].length };
+  const raw = rtrim(cap[0], '\n');
+  return { token: { type: 'hr', raw }, pos: pos + raw.length };
 }
 
 function tokBlockquote(st, src, pos) {
@@ -743,6 +747,29 @@ function listBreakKind(src, start, end, maxLead) {
   return 0;
 }
 
+// Index of the first character of `s` that is not a space, or -1.
+function firstNonSpace(s) {
+  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) !== 32) return i;
+  return -1;
+}
+
+// Is `s` blank (only whitespace, as trim() would judge a single line)?
+function isBlank(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== 32 && c !== 9 && c !== 10 && c !== 11 && c !== 12 && c !== 13) return false;
+  }
+  return true;
+}
+
+// Expand the leading whitespace of `line` to spaces (tabs run to the
+// next tab stop), or return the line unchanged when it has none.
+function expandLeading(line, indent) {
+  const c = line.charCodeAt(0);
+  if (c !== 32 && c !== 9) return line;
+  return line.replace(O.leadingSpaceTab, (ws) => expandTabs(ws, indent));
+}
+
 function tokList(st, src, startPos) {
   const cap = at(BLOCK.list, src, startPos);
   if (!cap) return;
@@ -774,15 +801,15 @@ function tokList(st, src, startPos) {
 
     const firstLineText = itemCap[2].split('\n', 1)[0];
     const bulletIndent = itemCap[1].length;
-    let line = firstLineText.replace(O.leadingSpaceTab, (ws) => expandTabs(ws, bulletIndent));
+    let line = expandLeading(firstLineText, bulletIndent);
     let [nextLine] = firstLine2(src, pos);
-    let blankLine = !line.trim();
+    let blankLine = isBlank(line);
 
     let indent = 0;
     if (blankLine) {
       indent = bulletIndent + 1;
     } else {
-      indent = line.search(O.nonSpaceChar);
+      indent = firstNonSpace(line);
       indent = indent > 4 ? 1 : indent;
       itemContents = line.slice(indent);
       indent += bulletIndent;
@@ -816,13 +843,14 @@ function tokList(st, src, startPos) {
 
         const rawLine = src.slice(pos, lineEnd);
         nextLine = rawLine;
-        const nextLineWithoutTabs = nextLine.replace(O.leadingSpaceTab, (ws) => expandTabs(ws));
+        const nextLineWithoutTabs = expandLeading(nextLine, 0);
 
-        if (nextLineWithoutTabs.search(O.nonSpaceChar) >= indent || !nextLine.trim()) {
+        if (firstNonSpace(nextLineWithoutTabs) >= indent || isBlank(nextLine)) {
           itemContents += '\n' + nextLineWithoutTabs.slice(indent);
         } else {
           if (blankLine) break;
-          if (line.replace(O.tabCharGlobal, '    ').search(O.nonSpaceChar) >= 4) break;
+          const lineNoTabs = line.includes('\t') ? line.replace(O.tabCharGlobal, '    ') : line;
+          if (firstNonSpace(lineNoTabs) >= 4) break;
           const lineKind = listBreakKind(line, 0, line.length, maxLead);
           if (lineKind & 1 && atStart(fencesBeginRegex, line)) break;
           if (lineKind & 2 && atStart(headingBeginRegex, line)) break;
@@ -838,7 +866,7 @@ function tokList(st, src, startPos) {
           itemContents += '\n' + continuation;
         }
 
-        blankLine = !nextLine.trim();
+        blankLine = isBlank(nextLine);
         pos = afterLine;
         line = nextLineWithoutTabs.slice(indent);
       }
@@ -941,7 +969,9 @@ function tokHtml(st, src, pos) {
       pre: cap[1] === 'pre' || cap[1] === 'script' || cap[1] === 'style',
       text: raw,
     },
-    pos: pos + cap[0].length,
+    // Advance by the trimmed raw, as marked's Lexer does: the newlines the
+    // trim dropped stay in the source and become a space token.
+    pos: pos + raw.length,
   };
 }
 
@@ -952,9 +982,10 @@ function tokDef(st, src, pos) {
   const tag = normalizeLabel(cap[1]);
   const href = cap[2] ? cap[2].replace(O.hrefBrackets, '$1').replace(INLINE.anyPunctuation, '$1') : '';
   const title = cap[3] ? cap[3].substring(1, cap[3].length - 1).replace(INLINE.anyPunctuation, '$1') : cap[3];
+  const raw = rtrim(cap[0], '\n');
   return {
-    token: { type: 'def', tag, raw: rtrim(cap[0], '\n'), href, title },
-    pos: pos + cap[0].length,
+    token: { type: 'def', tag, raw, href, title },
+    pos: pos + raw.length,
   };
 }
 
@@ -986,19 +1017,20 @@ function tokTable(st, src, pos) {
       text: cell, tokens: queueInline(st, cell), header: false, align: item.align[i],
     })));
   }
-  return { token: item, pos: pos + cap[0].length };
+  return { token: item, pos: pos + item.raw.length };
 }
 
 function tokLheading(st, src, pos) {
   const cap = at(BLOCK.lheading, src, pos);
   if (!cap) return;
   const text = cap[1].trim();
+  const raw = rtrim(cap[0], '\n');
   return {
     token: {
-      type: 'heading', raw: rtrim(cap[0], '\n'),
+      type: 'heading', raw,
       depth: cap[2].charAt(0) === '=' ? 1 : 2, text, tokens: queueInline(st, text),
     },
-    pos: pos + cap[0].length,
+    pos: pos + raw.length,
   };
 }
 
@@ -1676,7 +1708,10 @@ function inlineTokens(st, src, tokens = []) {
 }
 
 function inlineTokensInner(st, src, tokens) {
-  const maskedSrc = src.includes('*') || src.includes('_') || src.includes('~')
+  // Masking only changes regions that start with a link bracket, a code
+  // span, a tag or an escape; a run holding none of those needs no mask.
+  const needsMask = src.includes('[') || src.includes('`') || src.includes('<') || src.includes('\\');
+  const maskedSrc = (src.includes('*') || src.includes('_') || src.includes('~')) && needsMask
     ? maskSrc(st, src)
     : src;
 
