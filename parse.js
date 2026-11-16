@@ -148,6 +148,32 @@ function otNormalize(src) {
   return src.replace(OT_RE, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
 }
 
+// marked's #n blockSkip regex (link | precode-code | html), applied to
+// the Ot-normalized source: every match is masked to `[aaa...]` for the
+// emStrong scan, so emphasis delimiters inside one are invisible.
+// In particular a code span with unequal backtick runs (`` ``guide` ``)
+// leaves a lone backtick that pairs with a later lone backtick, forming
+// a spurious code span that swallows the text between them.
+const BLOCKSKIP_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+// [start, end) source ranges masked by blockSkip's code-span and html
+// matches (on the Ot-normalized source; Ot preserves length, so
+// positions line up with the original). Link matches are NOT included:
+// a link label's delimiters must stay visible so they can resolve
+// inside the link's text when it forms; a link that never forms is
+// handled by the masked-link logic in the ']' handler.
+function blockSkipRegions(src) {
+  const norm = otNormalize(src);
+  const regions = [];
+  BLOCKSKIP_RE.lastIndex = 0;
+  let m;
+  while ((m = BLOCKSKIP_RE.exec(norm)) !== null) {
+    if (m[0].length === 0) { BLOCKSKIP_RE.lastIndex++; continue; }
+    if (m[0][0] === '[') continue; // a link match: not a masked region here
+    regions.push([m.index, m.index + m[0].length]);
+  }
+  return regions;
+}
+
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]{1,31}:/;
 const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
 const EXT_URL_RE = /^(?:[Hh][Tt][Tt][Pp][Ss]?:\/\/|www\.)[^\s<]*/;
@@ -1262,10 +1288,12 @@ function parseInline(src, ctx) {
   const brackets = []; // {idx, img, active, srcPos, labelEnd}
   let buf = '';
   // [start, end) source ranges masked by marked's #n (a `[...](...)`
-  // whose label only closes after Ot-normalizing its code spans):
-  // emphasis delimiters inside such a range are invisible to emStrong
-  // and must never pair. Cached Ot-normalized source (same length).
-  const maskedRegions = [];
+  // whose label only closes after Ot-normalizing its code spans, and
+  // every blockSkip match — link, code span, html tag — on the
+  // Ot-normalized source): emphasis delimiters inside such a range are
+  // invisible to emStrong and must never pair. Cached Ot-normalized
+  // source (same length).
+  const maskedRegions = (src.includes('`') || src.includes('[') || src.includes('<')) ? blockSkipRegions(src) : [];
   let normSrc = null;
   const inMaskedRegion = (p) => {
     for (let r = 0; r < maskedRegions.length; r++) {
@@ -1332,9 +1360,12 @@ function parseInline(src, ctx) {
     const h = before === '*' || before === '_' || isPunct(before);
     const d = (after !== undefined && after !== ch && isPunct(after)) ? after : '';
     const R = !!before && !!before.trim() && (!!d || (ch === '*' && !h));
-    // a delimiter inside a masked link region is invisible to marked's
-    // emStrong scan: keep the literal node, but never let it pair
-    if (!inMaskedRegion(i)) delims.push({ ch, n, open, close, idx: nodes.length, srcPos: i, R });
+    // a delimiter inside a masked region is invisible to marked's
+    // emStrong scan at this level: keep the literal node and the entry
+    // (so it can still resolve inside a link's text, whose own masked
+    // source is just the label), but flag it so the top-level resolve
+    // skips it
+    delims.push({ ch, n, open, close, idx: nodes.length, srcPos: i, R, masked: inMaskedRegion(i) });
     nodes.push({ k: 'delim', ch, n, open: null, close: null });
   };
   const hardBreak = (force) => {
@@ -1671,7 +1702,10 @@ function parseInline(src, ctx) {
     buf += c; i++;
   }
   flush();
-  resolveEmphasis(nodes, delims);
+  // top-level resolve skips delimiters inside a masked region (they are
+  // invisible to emStrong here); link-text resolves keep them, since a
+  // link's own masked source is just its label text
+  resolveEmphasis(nodes, delims.filter((d) => !d.masked));
   return renderNodes(nodes);
 }
 
