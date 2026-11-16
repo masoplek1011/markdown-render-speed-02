@@ -138,7 +138,7 @@ function flanking(before, after) {
 
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]{1,31}:/;
 const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
-const EXT_URL_RE = /^(?:[Hh][Tt][Tt][Pp][Ss]?:\/\/|www\.)[^\s<>\[\]]*/;
+const EXT_URL_RE = /^(?:[Hh][Tt][Tt][Pp][Ss]?:\/\/|www\.)[^\s<]*/;
 const TAGNAME_RE = /^[A-Za-z][A-Za-z0-9-]*/;
 // lookup table: ASCII chars allowed in an email local part
 const EMAIL_LOCAL = new Uint8Array(128);
@@ -1129,23 +1129,49 @@ function renderLink(nd) {
   return s + '>' + renderNodes(nd.kids) + '</a>';
 }
 
-// Trim trailing punctuation from an extended autolink match (GFM rules).
-function trimAutolink(u) {
-  let end = u.length;
-  while (end > 0) {
-    // a trailing entity-like &name; is not part of the URL
-    const amp = u.lastIndexOf('&', end - 1);
-    if (amp >= 0 && /^&[A-Za-z][A-Za-z0-9]*;$/.test(u.slice(amp, end))) { end = amp; continue; }
-    const c = u[end - 1];
-    if (c === '?' || c === '!' || c === '.' || c === ',' || c === ':' || c === ';' || c === '*' || c === '_' || c === '~') { end--; continue; }
-    if (c === ')') {
-      let open = 0, close = 0;
-      for (let i = 0; i < end; i++) { if (u[i] === '(') open++; else if (u[i] === ')') close++; }
-      if (close > open) { end--; continue; }
+// Marked's extended-autolink backpedal: repeatedly keep the longest
+// prefix matching this until stable. A trailing run of punctuation is
+// trimmed, but balanced (...) and a trailing &entity; are kept.
+const BACKPEDAL_RE = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
+function backpedalUrl(u) {
+  let prev;
+  do { prev = u; u = (BACKPEDAL_RE.exec(u) || [''])[0]; } while (u !== prev);
+  return u;
+}
+
+// End of a link label starting just after '[' at `i`: the index of the
+// ']' that closes it, or -1 if the label never closes. Mirrors marked's
+// inline-link label pattern `re`: balanced nested brackets, escapes,
+// and code spans (a backtick run + backtick-free content + any backtick
+// run, or 2+ backticks immediately before ']'). A backtick run that
+// cannot close a code span ends the label there.
+function findLabelEnd(src, i) {
+  let depth = 0;
+  let j = i;
+  const N = src.length;
+  while (j < N) {
+    const c = src[j];
+    if (c === '\\') { j += 2; continue; }
+    if (c === '`') {
+      let k = j, n = 0;
+      while (k < N && src[k] === '`') { k++; n++; }
+      if (n >= 2 && src[k] === ']') return k;
+      let m = k;
+      while (m < N && src[m] !== '`') m++;
+      if (m >= N) return -1;
+      let e = m;
+      while (e < N && src[e] === '`') e++;
+      j = e;
+      continue;
     }
-    break;
+    if (c === '[') { depth++; j++; continue; }
+    if (c === ']') {
+      if (depth === 0) return j;
+      depth--; j++; continue;
+    }
+    j++;
   }
-  return u.slice(0, end);
+  return -1;
 }
 
 // Parse inline markdown to HTML. `ctx.refs` maps normalized labels to
@@ -1158,8 +1184,41 @@ function parseInline(src, ctx) {
   const refs = ctx.refs;
   const nodes = [];
   const delims = [];
-  const brackets = []; // {idx, img, active}
+  const brackets = []; // {idx, img, active, srcPos, labelEnd}
   let buf = '';
+  // label end of the innermost open bracket (cached on the record):
+  // -1 when there is no open bracket or its label never closes
+  const labelEndOf = (br) => {
+    if (br.labelEnd === undefined) br.labelEnd = findLabelEnd(src, br.srcPos);
+    return br.labelEnd;
+  };
+  const activeBracket = () => {
+    for (let b = brackets.length - 1; b >= 0; b--) {
+      if (brackets[b].active) return brackets[b];
+    }
+    return null;
+  };
+  const activeLabelEnd = () => {
+    const br = activeBracket();
+    return br ? labelEndOf(br) : -1;
+  };
+  // does the label text scanned so far already contain a link? Such a
+  // bracket can never form a link (marked drops a link whose text
+  // emitted a link), so a URL / code span inside it is plain paragraph
+  // text and must not be bounded by the label end
+  const labelHasLink = (br) => {
+    for (let q = br.idx + 1; q < nodes.length; q++) if (nodes[q].k === 'link') return true;
+    return false;
+  };
+  // the label end that bounds a URL / code span, or -1 for unbounded:
+  // only a bracket that may still form a link (an image, or a label
+  // with no link in it yet) bounds its contents
+  const boundingLabelEnd = () => {
+    const br = activeBracket();
+    if (!br) return -1;
+    if (!br.img && labelHasLink(br)) return -1;
+    return labelEndOf(br);
+  };
   const flush = () => { if (buf) { nodes.push({ k: 't', s: buf }); buf = ''; } };
   const pushDelim = (ch, n, before, after) => {
     const [lb, rb] = flanking(before, after);
@@ -1224,8 +1283,14 @@ function parseInline(src, ctx) {
     if (c === '`') {
       let j = i, n = 0;
       while (j < N && src[j] === '`') { j++; n++; }
+      // inside a link label a code span must close before the label
+      // ends (marked tokenizes the label's code spans within the
+      // label); bound the equal-run search by the label end so it
+      // cannot swallow the '](...)' that follows the label
+      const bound = boundingLabelEnd();
+      const limit = bound >= 0 ? bound : N;
       let close = -1, k = j;
-      while (k < N) {
+      while (k < limit) {
         if (src[k] === '`') {
           let m = k, cnt = 0;
           while (m < N && src[m] === '`') { m++; cnt++; }
@@ -1279,6 +1344,16 @@ function parseInline(src, ctx) {
       while (bi >= 0 && !brackets[bi].active) bi--;
       if (bi < 0) { buf += ']'; i++; continue; }
       const br = brackets[bi];
+      // the label must close here (marked's label pattern): a ']' that
+      // is not the label end is literal text inside the label, and a
+      // label that never closes can never form a link
+      const labelEnd = labelEndOf(br);
+      if (labelEnd < 0) {
+        br.active = false;
+        buf += ']'; i++;
+        continue;
+      }
+      if (labelEnd !== i) { buf += ']'; i++; continue; }
       const textNodes = nodes.slice(br.idx + 1);
       // a link cannot contain another link
       let hasLink = false;
@@ -1416,7 +1491,13 @@ function parseInline(src, ctx) {
       const rest = src.slice(i);
       const m = EXT_URL_RE.exec(rest);
       if (m) {
-        const u = trimAutolink(m[0]);
+        // a URL inside a link label cannot swallow the ']' that closes
+        // the label (marked matches the link first): truncate to the
+        // label end, then backpedal
+        let raw = m[0];
+        const bound = boundingLabelEnd();
+        if (bound >= 0 && i + raw.length > bound) raw = raw.slice(0, bound - i);
+        const u = backpedalUrl(raw);
         const isWww = u.startsWith('www.');
         const ok = u.length > 0 && (isWww
           ? /^www\.[^\s\/]+/.test(u)
