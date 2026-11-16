@@ -342,7 +342,9 @@ function resolveEmphasis(nodes, ds) {
   const trapRange = (idx) => {
     let best = null;
     for (let r = 0; r < closed.length; r++) {
-      if (idx > closed[r][0] && idx < closed[r][1]) {
+      // strictly inside, or the range's own opener on a re-scan (its
+      // leftover chars sit inside the tag it just opened)
+      if (idx >= closed[r][0] && idx < closed[r][1]) {
         if (!best || closed[r][0] > best[0]) best = closed[r];
       }
     }
@@ -360,16 +362,38 @@ function resolveEmphasis(nodes, ds) {
     const k = op.n, y = op.y, R = op.R, o = op.o;
     let m = k, f = 0;
     const range = trapRange(op.idx);
-    let found = -1, bPrime = 0;
+    let found = -1, bPrime = 0, firstSame = true;
     for (let ci = oi + 1; ci < ds.length; ci++) {
       const cl = ds[ci];
       if (cl.ch !== op.ch || cl.n <= 0) continue;
       if (range && (cl.idx < range[0] || cl.idx > range[1])) continue;
+      // marked's RDelim regex first skips `__...*...__` (a `*` inside
+      // a `__` strong, and vice versa) when it opens the scan: the
+      // first same-char run is invisible if it sits directly between
+      // a strong opener and closer of the other char
+      if (firstSame) {
+        firstSame = false;
+        const other = op.ch === '*' ? '_' : '*';
+        const prev = ds[ci - 1];
+        const next = ds[ci + 1];
+        if (ci - 1 === oi + 1 && prev && prev.ch === other && prev.n >= 2 && prev.open &&
+            next && next.ch === other && next.n >= 2 && next.close) {
+          continue;
+        }
+      }
       const openOnly = cl.open && !cl.close;
       const closeOnly = cl.close && !cl.open;
       const both = cl.open && cl.close;
       if (!openOnly && !closeOnly && !both) continue;
-      const b = cl.n;
+      // a closer on the boundary of the opener's trapping range only
+      // offers its inner chars (inside the tag) here; the rest of the
+      // run sits outside the tag and cannot close an inner opener
+      let b = cl.n;
+      if (range && cl.idx === range[1]) {
+        const cn = nodes[cl.idx];
+        b = Math.max(0, (cn.maxBPrime || 0) - (cn.usedClose || 0));
+        if (b <= 0) continue;
+      }
       if (openOnly) { m += b; continue; }
       if (both || R) {
         if (o && both) break;
@@ -406,8 +430,10 @@ function resolveEmphasis(nodes, ds) {
     cn.close = cn.close || [];
     cn.close.unshift('</' + tag + '>');
     // the closer's b'-use extra chars land INSIDE the tag (before the
-    // closing tag); the rest of the closer run stays outside it
-    if (bPrime > use) cn.innerClose = (cn.innerClose || 0) + (bPrime - use);
+    // closing tag); the rest of the closer run stays outside it. Track
+    // the widest raw (max b') so the renderer can split the leftover
+    // chars into inner (maxBPrime - usedClose) and outer (the rest)
+    if (bPrime > (cn.maxBPrime || 0)) cn.maxBPrime = bPrime;
     op.n -= use;
     cl.n -= use;
     on.usedOpen = (on.usedOpen || 0) + use;
@@ -1186,11 +1212,13 @@ function renderNodes(nodes) {
     } else if (nd.k === 'delim') {
       // leftover chars of a run: litBefore (retry chars, before the
       // opening tag), innerClose (closer chars inside the tag, before
-      // the closing tag); the rest sit inside an opener / outside a
-      // closer
+      // the closing tag: the widest raw's b' minus the tag chars);
+      // the rest sit inside an opener / outside a closer
       const left = Math.max(0, nd.n - (nd.usedOpen || 0) - (nd.usedClose || 0));
-      const litBefore = Math.min(left, nd.litBefore || 0);
-      const innerClose = Math.min(left - litBefore, nd.innerClose || 0);
+      // litBefore only applies to a node that opens a tag; on a
+      // closer-only node the retry chars are just outer literal chars
+      const litBefore = nd.open ? Math.min(left, nd.litBefore || 0) : 0;
+      const innerClose = Math.min(left - litBefore, Math.max(0, (nd.maxBPrime || 0) - (nd.usedClose || 0)));
       const mid = left - litBefore - innerClose;
       if (nd.open && !nd.close) {
         out += nd.ch.repeat(litBefore);
