@@ -352,16 +352,23 @@ function lexLines(lines, refs, trailNL, lazySetext, codeMerged, top) {
       const fence = fm[1], ch = fence[0], flen = fence.length;
       const info = fm[2].trim();
       const lang = unescBackslash(info.split(/[ \t]+/)[0] || '');
-      // only backtick fences dedent their content; tilde fences keep
-      // the content lines exactly as written
-      const dedent = ch === '`' ? Math.min(3, leadWs(line).col) : 0;
+      // marked's Dt(): only backtick fences dedent, and only by the
+      // fence line's leading whitespace CHARACTER count (a tab counts
+      // as 1 char, not 4 columns): each content line loses up to that
+      // many leading whitespace characters. Tilde fences and
+      // unindented fences keep content lines exactly as written.
+      const comp = ch === '`' ? /^(\s+)(?:```)/.exec(line) : null;
+      const dedent = comp ? comp[1].length : 0;
       const content = [];
       let j = i + 1;
       while (j < n) {
         const l2 = lines[j];
         const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(l2);
         if (cm && cm[1][0] === ch && cm[1].length >= flen) break;
-        content.push(stripIndent(l2, dedent));
+        if (dedent) {
+          const ws = /^\s+/.exec(l2);
+          content.push(ws ? l2.slice(Math.min(ws[0].length, dedent)) : l2);
+        } else content.push(l2);
         j++;
       }
       if (j === n && trailNL && content.length && content[content.length - 1] === '') content.pop();
@@ -539,7 +546,10 @@ function lexBlockquote(lines, i, refs, trailNL) {
     relex();
     const last = toks[toks.length - 1];
     // lazy lines may continue a paragraph, or descend into a nested
-    // blockquote/list to reach an open paragraph inside (cm-292)
+    // blockquote/list to reach an open paragraph inside (cm-292).
+    // A code block (e.g. an unterminated fence) ends the lazy
+    // continuation: lazy lines never continue a fence in marked, the
+    // blockquote ends at its last marked line.
     if (!last || (last.t !== 'p' && last.t !== 'bq' && last.t !== 'list')) break;
     // lazy continuation lines (only while a paragraph is open)
     let lazyDone = false;
@@ -549,7 +559,9 @@ function lexBlockquote(lines, i, refs, trailNL) {
       if (inner.length && inner[inner.length - 1] === '') break;
       if (stripBlockquote(line) !== null) break;
       if (HR_RE.test(line)) break;
-      if (startsBlock(lines, j, true)) break;
+      // marked's blockquote paragraph pattern interrupts on ANY
+      // ordered-list start number, not only 1
+      if (startsBlock(lines, j, true, false)) break;
       if (SETEXT_RE.test(line)) {
         if (prevLazy) inner.push('    ' + line.replace(/^[ ]+/, ''));
         else { lazySetext.add(inner.length); inner.push(line); }
@@ -971,6 +983,27 @@ function lexList(lines, i, refs, trailNL) {
   return { tok: { t: 'list', ordered, start, loose, items }, next: j, trailBlank };
 }
 
+// Does the previous dedented line (marked's `m`) end a list item for a
+// following outdented (lazy) line? Mirrors the list-item loop's
+// else-branch: a lazy line cannot follow a previous line that starts a
+// fence / heading / html block / hr (with the indent allowance clamped
+// to contentCol-1, as in marked's D() regex cache) or is indented code
+// (>= 4 leading spaces after tab expansion).
+function prevLineBreaksLazy(prev, contentCol) {
+  const exp = prev.replace(/\t/g, '    ');
+  if (exp.search(/[^ ]/) >= 4) return true;
+  const a = Math.max(0, Math.min(3, contentCol - 1));
+  if (new RegExp(`^ {0,${a}}(?:\`{3,}|~{3,})`).test(prev)) return true;
+  if (new RegExp(`^ {0,${a}}#{1,6}(?:\\s|$)`).test(prev)) return true;
+  if (new RegExp(`^ {0,${a}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})[ \\t]*(?:\\n|$)`).test(prev)) return true;
+  const lead = (/^ */.exec(prev) || [''])[0].length;
+  if (lead <= a) {
+    const ht = htmlBlockType(prev);
+    if (ht >= 1 && ht <= 6) return true;
+  }
+  return false;
+}
+
 function collectItem(lines, j, lm, refs, trailNL) {
   const contentCol = lm.contentCol;
   let firstContent = lm.content;
@@ -1010,6 +1043,11 @@ function collectItem(lines, j, lm, refs, trailNL) {
     if (blanks > 0) break;
     if (HR_RE.test(l2)) break;
     if (startsBlock(lines, k, true, false)) break;
+    // a fence / heading / html / hr / indented-code line consumed into
+    // the item leaves the following outdented lines outside it (the
+    // fence inside the item is empty; its would-be content becomes
+    // top-level blocks)
+    if (prevLineBreaksLazy(prevM, contentCol)) break;
     if (SETEXT_RE.test(l2) && lheadingPrevOk(prevM)) {
       lazySetext.add(itemLines.length);
       itemLines.push(l2);
