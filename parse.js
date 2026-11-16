@@ -1393,7 +1393,7 @@ function parseInline(src, ctx) {
     // (so it can still resolve inside a link's text, whose own masked
     // source is just the label), but flag it so the top-level resolve
     // skips it
-    delims.push({ ch, n, open, close, idx: nodes.length, srcPos: i, R, masked: inMaskedRegion(i) });
+    delims.push({ ch, n, open, close, idx: nodes.length, srcPos: i, R, masked: maskedRegions.length ? inMaskedRegion(i) : false });
     nodes.push({ k: 'delim', ch, n, open: null, close: null });
   };
   const hardBreak = (force) => {
