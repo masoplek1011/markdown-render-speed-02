@@ -1374,6 +1374,26 @@ function parseInline(src, ctx) {
     if (!br.img && labelHasLink(br)) return -1;
     return labelEndOf(br);
   };
+  // does the bracket form a link at this label end (inline dest or
+  // reference)? Mirrors the ']' handler's link-formation check.
+  const bracketFormsLinkAt = (br, bound) => {
+    const after = src.slice(bound + 1);
+    if (after[0] === '(') {
+      const lt = scanLinkTarget(after);
+      if (lt) return true;
+    }
+    let lab = null;
+    if (after[0] === '[') {
+      const e = after.indexOf(']', 1);
+      if (e >= 0) lab = after.slice(1, e);
+    }
+    if (lab === null || lab === '') lab = src.slice(br.srcPos, bound);
+    if (lab !== null) {
+      const ref = refs.get(normLabel(lab));
+      if (ref) return true;
+    }
+    return false;
+  };
   const flush = () => { if (buf) { nodes.push({ k: 't', s: buf }); buf = ''; } };
   const pushDelim = (ch, n, before, after) => {
     const [lb, rb] = flanking(before, after);
@@ -1670,11 +1690,19 @@ function parseInline(src, ctx) {
       const m = EXT_URL_RE.exec(rest);
       if (m) {
         // a URL inside a link label cannot swallow the ']' that closes
-        // the label (marked matches the link first): truncate to the
-        // label end, then backpedal
+        // the label when the bracket forms a link there (marked matches
+        // the link first): truncate to the label end, then backpedal.
+        // But when the bracket does NOT form a link at that ']', the
+        // ']' is part of the URL (an extended autolink eats it) and the
+        // label stays literal.
         let raw = m[0];
-        const bound = boundingLabelEnd();
-        if (bound >= 0 && i + raw.length > bound) raw = raw.slice(0, bound - i);
+        const br = activeBracket();
+        if (br && (br.img || !labelHasLink(br))) {
+          const bound = labelEndOf(br);
+          if (bound >= 0 && i + raw.length > bound && bracketFormsLinkAt(br, bound)) {
+            raw = raw.slice(0, bound - i);
+          }
+        }
         const u = backpedalUrl(raw);
         const isWww = u.startsWith('www.');
         const ok = u.length > 0 && (isWww
