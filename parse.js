@@ -435,7 +435,7 @@ function lexLines(lines, refs, trailNL, lazySetext, codeMerged, top) {
       // trailing newline survives). The split-artifact line ('' at n-1
       // when the source ends with '\n') is not a real blank line.
       const endLine = j - 1;
-      if (endLine < n - 1 || trailNL) {
+      if (endLine < n - 1) {
         text += '\n';
         let k = j;
         if (ht === 6 || ht === 7) {
