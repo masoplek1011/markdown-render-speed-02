@@ -1083,9 +1083,14 @@ function trimAutolink(u) {
   return u.slice(0, end);
 }
 
-// Parse inline markdown to HTML. `refs` maps normalized labels to
-// {href, title}.
-function parseInline(src, refs) {
+// Parse inline markdown to HTML. `ctx.refs` maps normalized labels to
+// {href,title} for reference links (first definition wins). `ctx.inLink`
+// mirrors marked's Lexer.state.inLink: set by a literal `<a ` open tag,
+// cleared by `</a>`, persisted across the whole document, and snapshotted
+// / restored around each link's text. While it is true, extended
+// autolinks (bare URLs and emails) do not form.
+function parseInline(src, ctx) {
+  const refs = ctx.refs;
   const nodes = [];
   const delims = [];
   const brackets = []; // {idx, img, active}
@@ -1183,13 +1188,22 @@ function parseInline(src, refs) {
         continue;
       }
       const ht = scanHtmlTag(rest);
-      if (ht) { flush(); nodes.push({ k: 'html', s: ht[0] }); i += ht[1]; continue; }
+      if (ht) {
+        flush();
+        nodes.push({ k: 'html', s: ht[0] });
+        // marked's Lexer.state.inLink: a literal "<a " tag opens it,
+        // "</a>" closes it (case-insensitive); other tags leave it.
+        if (!ctx.inLink && /^<a /i.test(ht[0])) ctx.inLink = true;
+        else if (ctx.inLink && /^<\/a>/i.test(ht[0])) ctx.inLink = false;
+        i += ht[1];
+        continue;
+      }
       buf += '<'; i++; continue;
     }
     if (c === '[' || (c === '!' && src[i + 1] === '[')) {
       const img = c === '!';
       flush();
-      brackets.push({ idx: nodes.length, img, active: true, srcPos: i + (img ? 2 : 1) });
+      brackets.push({ idx: nodes.length, img, active: true, srcPos: i + (img ? 2 : 1), inLink: ctx.inLink });
       nodes.push({ k: 'open', img });
       i += img ? 2 : 1;
       continue;
@@ -1259,6 +1273,7 @@ function parseInline(src, refs) {
         for (let b = brackets.length - 1; b >= bi; b--) brackets.splice(b, 1);
         nodes.length = br.idx;
         nodes.push(nd);
+        ctx.inLink = br.inLink; // marked restores inLink after link text
         i += 1 + made.len;
         continue;
       }
@@ -1294,7 +1309,7 @@ function parseInline(src, refs) {
       if (m) { flush(); nodes.push({ k: 'ent', s: m[0] }); i += m[0].length; continue; }
       buf += '&'; i++; continue;
     }
-    if (c === 'm' || c === 'x') {
+    if ((c === 'm' || c === 'x') && !ctx.inLink) {
       // mailto: / xmpp: + email is a single autolink (xmpp may add one
       // /path segment); only at a word boundary
       const prev = src[i - 1];
@@ -1332,7 +1347,7 @@ function parseInline(src, refs) {
         }
       }
     }
-    if (c === 'h' || c === 'w' || c === 'H' || c === 'W') {
+    if ((c === 'h' || c === 'w' || c === 'H' || c === 'W') && !ctx.inLink) {
       const rest = src.slice(i);
       const m = EXT_URL_RE.exec(rest);
       if (m) {
@@ -1375,7 +1390,7 @@ function parseInline(src, refs) {
           }
         }
       }
-      if (m && !badTail) {
+      if (m && !badTail && !ctx.inLink) {
         const em = m[0];
         const at = em.indexOf('@');
         const dom = em.slice(at + 1);
@@ -1434,34 +1449,34 @@ function altText(nodes) {
 
 // ===================== renderer =====================
 
-function renderToks(toks, refs) {
+function renderToks(toks, ctx) {
   let out = '';
-  for (const tk of toks) out += renderTok(tk, refs);
+  for (const tk of toks) out += renderTok(tk, ctx);
   return out;
 }
 
-function renderTok(tk, refs) {
+function renderTok(tk, ctx) {
   switch (tk.t) {
-    case 'p': return '<p>' + parseInline(tk.text, refs) + '</p>\n';
-    case 'h': return '<h' + tk.level + '>' + parseInline(tk.text, refs) + '</h' + tk.level + '>\n';
+    case 'p': return '<p>' + parseInline(tk.text, ctx) + '</p>\n';
+    case 'h': return '<h' + tk.level + '>' + parseInline(tk.text, ctx) + '</h' + tk.level + '>\n';
     case 'hr': return '<hr>\n';
     case 'code': {
       const cls = tk.lang ? ' class="language-' + escAttr(tk.lang) + '"' : '';
       return '<pre><code' + cls + '>' + esc(tk.text) + '</code></pre>\n';
     }
     case 'html': return tk.text;
-    case 'bq': return '<blockquote>\n' + renderToks(tk.toks, refs) + '</blockquote>\n';
-    case 'table': return renderTable(tk, refs);
-    case 'list': return renderList(tk, refs);
+    case 'bq': return '<blockquote>\n' + renderToks(tk.toks, ctx) + '</blockquote>\n';
+    case 'table': return renderTable(tk, ctx);
+    case 'list': return renderList(tk, ctx);
     default: return '';
   }
 }
 
-function renderTable(tk, refs) {
+function renderTable(tk, ctx) {
   let out = '<table>\n<thead>\n<tr>\n';
   for (let c = 0; c < tk.head.length; c++) {
     const a = tk.align[c];
-    out += '<th' + (a ? ' align="' + a + '"' : '') + '>' + parseInline(tk.head[c], refs) + '</th>\n';
+    out += '<th' + (a ? ' align="' + a + '"' : '') + '>' + parseInline(tk.head[c], ctx) + '</th>\n';
   }
   out += '</tr>\n</thead>\n';
   if (tk.rows.length) {
@@ -1471,7 +1486,7 @@ function renderTable(tk, refs) {
       for (let c = 0; c < tk.head.length; c++) {
         const a = tk.align[c];
         const cell = c < row.length ? row[c] : '';
-        out += '<td' + (a ? ' align="' + a + '"' : '') + '>' + parseInline(cell, refs) + '</td>\n';
+        out += '<td' + (a ? ' align="' + a + '"' : '') + '>' + parseInline(cell, ctx) + '</td>\n';
       }
       out += '</tr>\n';
     }
@@ -1482,14 +1497,14 @@ function renderTable(tk, refs) {
   return out;
 }
 
-function renderList(tk, refs) {
+function renderList(tk, ctx) {
   const tag = tk.ordered ? 'ol' : 'ul';
   let out = '<' + tag + (tk.ordered && tk.start !== 1 ? ' start="' + tk.start + '"' : '') + '>\n';
-  for (const item of tk.items) out += renderItem(item, tk.loose, refs);
+  for (const item of tk.items) out += renderItem(item, tk.loose, ctx);
   return out + '</' + tag + '>\n';
 }
 
-function renderItem(item, loose, refs) {
+function renderItem(item, loose, ctx) {
   const box = item.task
     ? (item.checked ? '<input checked="" disabled="" type="checkbox"> ' : '<input disabled="" type="checkbox"> ')
     : '';
@@ -1498,11 +1513,11 @@ function renderItem(item, loose, refs) {
   for (let i = 0; i < toks.length; i++) {
     const tk = toks[i];
     if (tk.t === 'p' && !loose) {
-      body += (i === 0 && box ? box : '') + parseInline(tk.text, refs);
+      body += (i === 0 && box ? box : '') + parseInline(tk.text, ctx);
     } else if (tk.t === 'p') {
-      body += '<p>' + (i === 0 && box ? box : '') + parseInline(tk.text, refs) + '</p>\n';
+      body += '<p>' + (i === 0 && box ? box : '') + parseInline(tk.text, ctx) + '</p>\n';
     } else {
-      body += (i === 0 && box ? box : '') + renderTok(tk, refs);
+      body += (i === 0 && box ? box : '') + renderTok(tk, ctx);
     }
   }
   if (!toks.length && box) body = box.slice(0, -1);
@@ -1515,7 +1530,8 @@ export function parse(src) {
   const lines = clean.split('\n');
   const trailNL = clean.length > 0 && clean.endsWith('\n');
   const toks = lexLines(lines, refs, trailNL);
-  return renderToks(toks, refs);
+  const ctx = { refs, inLink: false };
+  return renderToks(toks, ctx);
 }
 
 
