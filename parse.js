@@ -300,47 +300,99 @@ function normLabel(s) {
 }
 
 // Resolve emphasis/delimiter runs inside `nodes` (a node array) using the
-// delimiter stack entries in `ds` (indices into `nodes`).
+// delimiter stack entries in `ds` (indices into `nodes`). This is a
+// faithful port of marked's emStrong scan: openers are tried left to
+// right (the outer opener first); the scan from an opener walks the
+// later same-char runs, accumulating `m` over open-only runs and `f`
+// over both-flanking runs skipped by the rule of 3, and only accepts a
+// closer when `m` drops to <= 0. A closer run contributes `b'` chars
+// (min of its length and b+m+f); `use` of them are the tag chars and
+// the rest land inside the tag. A failed scan consumes one char as
+// literal text (litBefore) and retries with the run shortened.
 function resolveEmphasis(nodes, ds) {
   // node-index ranges of emphasis already closed; an opener strictly
   // inside one cannot match a closer outside it (cm-469, cm-470)
   const closed = [];
-  const trapped = (idx) => {
+  const trapRange = (idx) => {
+    let best = null;
     for (let r = 0; r < closed.length; r++) {
-      if (idx > closed[r][0] && idx < closed[r][1]) return true;
-    }
-    return false;
-  };
-  let ci = 0;
-  while (ci < ds.length) {
-    const closer = ds[ci];
-    if (!closer.close || closer.n <= 0) { ci++; continue; }
-    let oi = ci - 1, found = -1;
-    while (oi >= 0) {
-      const op = ds[oi];
-      if (op.n > 0 && op.open && op.ch === closer.ch && !trapped(op.idx)) {
-        const odd = (op.close || closer.open) &&
-          ((op.n + closer.n) % 3 === 0) && (op.n % 3 !== 0 || closer.n % 3 !== 0);
-        if (!odd) { found = oi; break; }
+      if (idx > closed[r][0] && idx < closed[r][1]) {
+        if (!best || closed[r][0] > best[0]) best = closed[r];
       }
-      oi--;
     }
-    if (found < 0) { ci++; continue; }
-    const op = ds[found];
-    const use = (op.n >= 2 && closer.n >= 2) ? 2 : 1;
-    if (use > op.n || use > closer.n) { ci++; continue; }
+    return best;
+  };
+  let oi = 0;
+  while (oi < ds.length) {
+    const op = ds[oi];
+    if (!op.open || op.n <= 0) { oi++; continue; }
+    // y is the run length for this "call": the full run length on a
+    // retry after a failed scan, the leftover length after a pairing.
+    // o is true once a retry has consumed a literal delimiter char
+    // before this opener: a both-flanking run then breaks the scan.
+    if (op.y === undefined) { op.y = op.n; op.o = false; }
+    const k = op.n, y = op.y, R = op.R, o = op.o;
+    let m = k, f = 0;
+    const range = trapRange(op.idx);
+    let found = -1, bPrime = 0;
+    for (let ci = oi + 1; ci < ds.length; ci++) {
+      const cl = ds[ci];
+      if (cl.ch !== op.ch || cl.n <= 0) continue;
+      if (range && (cl.idx < range[0] || cl.idx > range[1])) continue;
+      const openOnly = cl.open && !cl.close;
+      const closeOnly = cl.close && !cl.open;
+      const both = cl.open && cl.close;
+      if (!openOnly && !closeOnly && !both) continue;
+      const b = cl.n;
+      if (openOnly) { m += b; continue; }
+      if (both || R) {
+        if (o && both) break;
+        if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      bPrime = Math.min(b, b + m + f);
+      found = ci;
+      break;
+    }
+    if (found < 0) {
+      if (op.n > 1) {
+        // scan failed: one char becomes literal text, retry shorter
+        // (o becomes true: the char before is now the delimiter)
+        op.n -= 1;
+        op.o = true;
+        const on = nodes[op.idx];
+        if (on && on.k === 'delim') on.litBefore = (on.litBefore || 0) + 1;
+        continue;
+      }
+      oi++;
+      continue;
+    }
+    const cl = ds[found];
+    const use = (Math.min(k, bPrime) % 2 === 1) ? 1 : 2;
     const tag = op.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
-    const on = nodes[op.idx], cn = nodes[closer.idx];
-    if (!on || !cn || on.k !== 'delim' || cn.k !== 'delim') { ci++; continue; }
+    const on = nodes[op.idx], cn = nodes[cl.idx];
+    if (!on || !cn || on.k !== 'delim' || cn.k !== 'delim') { oi++; continue; }
+    // the outer pair forms first, so its opening tag goes first and
+    // its closing tag goes last
     on.open = on.open || [];
-    on.open.unshift('<' + tag + '>');
+    on.open.push('<' + tag + '>');
     cn.close = cn.close || [];
-    cn.close.push('</' + tag + '>');
-    op.n -= use; closer.n -= use;
+    cn.close.unshift('</' + tag + '>');
+    // the closer's b'-use extra chars land INSIDE the tag (before the
+    // closing tag); the rest of the closer run stays outside it
+    if (bPrime > use) cn.innerClose = (cn.innerClose || 0) + (bPrime - use);
+    op.n -= use;
+    cl.n -= use;
     on.usedOpen = (on.usedOpen || 0) + use;
     cn.usedClose = (cn.usedClose || 0) + use;
-    closed.push([op.idx, closer.idx]);
-    if (closer.n <= 0) ci++;
+    closed.push([op.idx, cl.idx]);
+    // the leftover opener chars form a fresh "call" (as in marked's
+    // recursive tokenization of the tag's text): y is the leftover length
+    // and o is false again
+    op.y = op.n;
+    op.o = false;
+    if (op.n <= 0) oi++;
   }
 }
 
@@ -1106,16 +1158,27 @@ function renderNodes(nodes) {
     } else if (nd.k === 'link' || nd.k === 'img') {
       out += renderLink(nd);
     } else if (nd.k === 'delim') {
-      const left = nd.ch.repeat(Math.max(0, nd.n - (nd.usedOpen || 0) - (nd.usedClose || 0)));
+      // leftover chars of a run: litBefore (retry chars, before the
+      // opening tag), innerClose (closer chars inside the tag, before
+      // the closing tag); the rest sit inside an opener / outside a
+      // closer
+      const left = Math.max(0, nd.n - (nd.usedOpen || 0) - (nd.usedClose || 0));
+      const litBefore = Math.min(left, nd.litBefore || 0);
+      const innerClose = Math.min(left - litBefore, nd.innerClose || 0);
+      const mid = left - litBefore - innerClose;
       if (nd.open && !nd.close) {
-        out += left;
+        out += nd.ch.repeat(litBefore);
         for (const t of nd.open) out += t;
+        out += nd.ch.repeat(mid);
       } else if (nd.close && !nd.open) {
+        out += nd.ch.repeat(innerClose);
         for (const t of nd.close) out += t;
-        out += left;
+        out += nd.ch.repeat(mid);
       } else {
-        out += left;
+        out += nd.ch.repeat(litBefore);
         if (nd.open) for (const t of nd.open) out += t;
+        out += nd.ch.repeat(mid);
+        out += nd.ch.repeat(innerClose);
         if (nd.close) for (const t of nd.close) out += t;
       }
     } else if (nd.k === 'open') {
@@ -1263,9 +1326,15 @@ function parseInline(src, ctx) {
       open = lb && (!rb || isPunct(before));
       close = rb && (!lb || isPunct(after));
     }
+    // marked's emStrong R flag: the char before the run is non-space
+    // and (the char after the run is punctuation, or the delimiter is
+    // '*' and the char before is not punctuation / a delimiter)
+    const h = before === '*' || before === '_' || isPunct(before);
+    const d = (after !== undefined && after !== ch && isPunct(after)) ? after : '';
+    const R = !!before && !!before.trim() && (!!d || (ch === '*' && !h));
     // a delimiter inside a masked link region is invisible to marked's
     // emStrong scan: keep the literal node, but never let it pair
-    if (!inMaskedRegion(i)) delims.push({ ch, n, open, close, idx: nodes.length, srcPos: i });
+    if (!inMaskedRegion(i)) delims.push({ ch, n, open, close, idx: nodes.length, srcPos: i, R });
     nodes.push({ k: 'delim', ch, n, open: null, close: null });
   };
   const hardBreak = (force) => {
