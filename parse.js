@@ -136,6 +136,18 @@ function flanking(before, after) {
   return [lb, rb];
 }
 
+const OT_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+// marked's #n masking step 1 (anyPunctuationOutsideCode): inside a code
+// span the backticks are replaced by '+' (same length, so positions are
+// preserved); a lone backtick run is left alone; an escaped punctuation
+// char becomes '+'s. After this step a code span whose content holds a
+// backtick looks like an ordinary equal-run code span, so marked's
+// blockSkip link pattern can match `[...](...)` even when the label's
+// code span has unequal runs in the raw text.
+function otNormalize(src) {
+  return src.replace(OT_RE, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+}
+
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]{1,31}:/;
 const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
 const EXT_URL_RE = /^(?:[Hh][Tt][Tt][Pp][Ss]?:\/\/|www\.)[^\s<]*/;
@@ -1186,6 +1198,30 @@ function parseInline(src, ctx) {
   const delims = [];
   const brackets = []; // {idx, img, active, srcPos, labelEnd}
   let buf = '';
+  // [start, end) source ranges masked by marked's #n (a `[...](...)`
+  // whose label only closes after Ot-normalizing its code spans):
+  // emphasis delimiters inside such a range are invisible to emStrong
+  // and must never pair. Cached Ot-normalized source (same length).
+  const maskedRegions = [];
+  let normSrc = null;
+  const inMaskedRegion = (p) => {
+    for (let r = 0; r < maskedRegions.length; r++) {
+      if (p >= maskedRegions[r][0] && p < maskedRegions[r][1]) return true;
+    }
+    return false;
+  };
+  // end (exclusive) of the masked `[...](...)` region for a bracket
+  // whose label never closes under marked's `re` rule, or -1: the
+  // label must close after Ot-normalization and be followed by a valid
+  // inline destination (the blockSkip link pattern then masks it).
+  const maskedLinkEnd = (br) => {
+    if (normSrc === null) normSrc = otNormalize(src);
+    const le = findLabelEnd(normSrc, br.srcPos);
+    if (le < 0 || src[le + 1] !== '(') return -1;
+    const lt = scanLinkTarget(src.slice(le + 1));
+    if (!lt) return -1;
+    return le + 1 + lt.len;
+  };
   // label end of the innermost open bracket (cached on the record):
   // -1 when there is no open bracket or its label never closes
   const labelEndOf = (br) => {
@@ -1227,7 +1263,9 @@ function parseInline(src, ctx) {
       open = lb && (!rb || isPunct(before));
       close = rb && (!lb || isPunct(after));
     }
-    delims.push({ ch, n, open, close, idx: nodes.length });
+    // a delimiter inside a masked link region is invisible to marked's
+    // emStrong scan: keep the literal node, but never let it pair
+    if (!inMaskedRegion(i)) delims.push({ ch, n, open, close, idx: nodes.length, srcPos: i });
     nodes.push({ k: 'delim', ch, n, open: null, close: null });
   };
   const hardBreak = (force) => {
@@ -1349,6 +1387,18 @@ function parseInline(src, ctx) {
       // label that never closes can never form a link
       const labelEnd = labelEndOf(br);
       if (labelEnd < 0) {
+        // the label never closes under marked's `re` rule, but if it
+        // closes after Ot-normalization and a valid inline dest follows,
+        // marked's #n masks the whole [...](...): drop the emphasis
+        // delimiters inside it (they are invisible to emStrong)
+        const mend = maskedLinkEnd(br);
+        if (mend >= 0) {
+          const start = br.srcPos - 1;
+          for (let d = delims.length - 1; d >= 0; d--) {
+            if (delims[d].srcPos >= start && delims[d].srcPos < mend) delims.splice(d, 1);
+          }
+          maskedRegions.push([start, mend]);
+        }
         br.active = false;
         buf += ']'; i++;
         continue;
