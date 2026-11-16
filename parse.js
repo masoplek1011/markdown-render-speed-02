@@ -419,8 +419,28 @@ function lexLines(lines, refs, trailNL, lazySetext, codeMerged, top) {
         } else j = i + 1;
       }
       let text = lines.slice(start, j).join('\n');
-      if (j < n && !isBlank(lines[j])) text += '\n';
-      else if (trailNL && j === n - 1 && lines[j] === '') text += '\n';
+      // marked's HTML-block regexes include the newline terminating the
+      // block's last line, plus the following blank run: for types 1-5
+      // only the newlines of empty lines (`\n*` / `\n+` stop at a
+      // space), for type 6/7 the whole run including spaces
+      // (`(?:\n[ \t]*)+\n`). The html tokenizer then runs ge(): if the
+      // match ends with 2+ blank lines they are all stripped (a single
+      // trailing newline survives). The split-artifact line ('' at n-1
+      // when the source ends with '\n') is not a real blank line.
+      const endLine = j - 1;
+      if (endLine < n - 1 || trailNL) {
+        text += '\n';
+        let k = j;
+        if (ht === 6 || ht === 7) {
+          while (k < n - 1 && isBlank(lines[k])) { text += lines[k] + '\n'; k++; }
+        } else {
+          while (k < n - 1 && lines[k] === '') { text += '\n'; k++; }
+        }
+      }
+      const parts = text.split('\n');
+      let t = parts.length - 1;
+      while (t >= 0 && /^[ \t]*$/.test(parts[t])) t--;
+      if (parts.length - 1 - t >= 2) text = parts.slice(0, t + 1).join('\n');
       toks.push({ t: 'html', text });
       i = j;
       continue;
