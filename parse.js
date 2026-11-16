@@ -622,6 +622,13 @@ function indentCols(line) { return leadWs(line).col; }
 const ATX_RE = /^ {0,3}(#{1,6})(?:[ \t]+|[ \t]*$)/;
 const HR_RE = /^ {0,3}(?:\*[ \t]*){3,}$|^ {0,3}(?:-[ \t]*){3,}$|^ {0,3}(?:_[ \t]*){3,}$/;
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+// A line starts a fence only if a backtick fence's info string holds no
+// backtick (marked's fence regex lookahead `(?=[^`\n]*(?:\n|$))`): a line
+// like ```inner backticks``` is paragraph text, not a fence.
+function isFenceLine(line) {
+  const fm = FENCE_RE.exec(line);
+  return !!fm && !(fm[1][0] === '`' && fm[2].includes('`'));
+}
 const SETEXT_RE = /^ {0,3}(=+|-+)[ \t]*$/;
 const BLOCK_TAGS = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param section source summary table tbody td tfoot th thead title tr track ul').split(' '));
 const HTML1_RE = /^ {0,3}<(script|pre|textarea|style)(?:[ \t>]|\/>|$)/i;
@@ -840,7 +847,7 @@ function startsBlock(lines, j, inPara, top) {
   if (j >= lines.length) return false;
   const line = lines[j];
   if (isBlank(line)) return false;
-  if (FENCE_RE.test(line)) return true;
+  if (isFenceLine(line)) return true;
   if (ATX_RE.test(line)) return true;
   if (inPara && SETEXT_RE.test(line)) return false;
   if (HR_RE.test(line)) return true;
@@ -1005,7 +1012,7 @@ function lheadingPrevOk(prev) {
   if (!prev || !prev.trim()) return false;
   if (/^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(prev)) return false;
   if (/^(?: {4}| {0,3}\t)/.test(prev)) return false;
-  if (/^ {0,3}(?:`{3,}|~{3,})/.test(prev)) return false;
+  if (isFenceLine(prev)) return false;
   if (/^ {0,3}>/.test(prev)) return false;
   if (/^ {0,3}#{1,6}(?:\s|$)/.test(prev)) return false;
   if (htmlBlockType(prev)) return false;
