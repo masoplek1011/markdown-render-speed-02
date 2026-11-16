@@ -722,6 +722,27 @@ function tokBlockquote(st, src, pos) {
   const token = { type: 'blockquote', raw, tokens, text };
   return { token, pos: pos + token.raw.length };
 }
+// Which list-breaking patterns could match at all, from the first
+// non-space character of the line (at most `maxLead` leading spaces are
+// allowed)? A bitmask: 1 fences, 2 heading, 4 html, 8 blockquote,
+// 16 bullet, 32 hr. A line starting with any other character cannot
+// break a list item, so its six pattern tests are skipped outright.
+function listBreakKind(src, start, end, maxLead) {
+  let s = start;
+  while (s < end && src[s] === ' ' && s - start < maxLead) s++;
+  if (s >= end) return 0;
+  const c = src[s];
+  if (c === ' ' || c === '\t') return 0;
+  if (c === '`' || c === '~') return 1;
+  if (c === '#') return 2;
+  if (c === '<') return 4;
+  if (c === '>') return 8;
+  if (c === '-' || c === '*' || c === '+') return 48;
+  if (c >= '0' && c <= '9') return 16;
+  if (c === '_') return 32;
+  return 0;
+}
+
 function tokList(st, src, startPos) {
   const cap = at(BLOCK.list, src, startPos);
   if (!cap) return;
@@ -779,29 +800,34 @@ function tokList(st, src, startPos) {
       const headingBeginRegex = O.headingBeginRegex(indent);
       const htmlBeginRegex = O.htmlBeginRegex(indent);
       const blockquoteBeginRegex = O.blockquoteBeginRegex(indent);
+      const maxLead = Math.max(0, Math.min(3, indent - 1));
 
       while (pos < src.length) {
-        const [rawLine, afterLine] = firstLine(src, pos);
-        let nextLineWithoutTabs;
-        nextLine = rawLine;
-        nextLineWithoutTabs = nextLine.replace(O.leadingSpaceTab, (ws) => expandTabs(ws));
+        const nl = src.indexOf('\n', pos);
+        const lineEnd = nl === -1 ? src.length : nl;
+        const afterLine = nl === -1 ? src.length : nl + 1;
+        const kind = listBreakKind(src, pos, lineEnd, maxLead);
+        if (kind & 1 && at(fencesBeginRegex, src, pos)) break;
+        if (kind & 2 && at(headingBeginRegex, src, pos)) break;
+        if (kind & 4 && at(htmlBeginRegex, src, pos)) break;
+        if (kind & 8 && at(blockquoteBeginRegex, src, pos)) break;
+        if (kind & 16 && at(nextBulletRegex, src, pos)) break;
+        if (kind & 32 && at(hrRegex, src, pos)) break;
 
-        if (atStart(fencesBeginRegex, nextLine)) break;
-        if (atStart(headingBeginRegex, nextLine)) break;
-        if (atStart(htmlBeginRegex, nextLine)) break;
-        if (atStart(blockquoteBeginRegex, nextLine)) break;
-        if (atStart(nextBulletRegex, nextLine)) break;
-        if (atStart(hrRegex, nextLine)) break;
+        const rawLine = src.slice(pos, lineEnd);
+        nextLine = rawLine;
+        const nextLineWithoutTabs = nextLine.replace(O.leadingSpaceTab, (ws) => expandTabs(ws));
 
         if (nextLineWithoutTabs.search(O.nonSpaceChar) >= indent || !nextLine.trim()) {
           itemContents += '\n' + nextLineWithoutTabs.slice(indent);
         } else {
           if (blankLine) break;
           if (line.replace(O.tabCharGlobal, '    ').search(O.nonSpaceChar) >= 4) break;
-          if (atStart(fencesBeginRegex, line)) break;
-          if (atStart(headingBeginRegex, line)) break;
-          if (atStart(htmlBeginRegex, line)) break;
-          if (atStart(hrRegex, line)) break;
+          const lineKind = listBreakKind(line, 0, line.length, maxLead);
+          if (lineKind & 1 && atStart(fencesBeginRegex, line)) break;
+          if (lineKind & 2 && atStart(headingBeginRegex, line)) break;
+          if (lineKind & 4 && atStart(htmlBeginRegex, line)) break;
+          if (lineKind & 32 && atStart(hrRegex, line)) break;
           // A lazy continuation can look like a setext underline after list
           // indentation is removed; keep it in the paragraph.
           const setextContinuation = /^ {0,3}(?:=+|-+) *$/.test(nextLine)
@@ -1625,122 +1651,17 @@ function tokUrl(st, src, pos) {
   };
 }
 
-// Characters that can appear inside an extended-autolink email address.
-const EMAIL_CHAR = new Uint8Array(128);
-for (const ch of "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&'*+/=?`{|}~-") {
-  EMAIL_CHAR[ch.charCodeAt(0)] = 1;
-}
-
-function isAsciiAlnum(code) {
-  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
-}
-
-function isEmailCharCode(code) {
-  return code < 128 && EMAIL_CHAR[code] === 1;
-}
-
-function startsEmailProtocol(src, i, end) {
-  if (i + 7 <= end && src[i] === 'm' && src.startsWith('mailto:', i)) return true;
-  if (i + 5 <= end && src[i] === 'x' && src.startsWith('xmpp:', i)) return true;
-  return false;
-}
-
-// The end of the text run starting at `pos`: the earliest of the next
-// character that starts another inline token, the start of a scheme://
-// or www. autolink, the start of an email address, and the start of the
-// spaces of a hard break. Each candidate is found with indexOf, which
-// scans in native code, instead of a lazy pattern with a lookahead at
-// every character.
-const TEXT_STOPS = ['\\', '<', '!', '[', '`', '*', '~', '_'];
-
-function scanTextEnd(src, pos, end) {
-  let i = pos;
-  const first = src.charCodeAt(i);
-  // A non-alphanumeric character right before mailto:/xmpp: is a run of
-  // its own; the link starts after it.
-  if (!isAsciiAlnum(first) && startsEmailProtocol(src, i + 1, end)) return i + 1;
-  if (first === 96) {
-    while (i < end && src.charCodeAt(i) === 96) i++;
-  } else if (first === 126) {
-    while (i < end && src.charCodeAt(i) === 126) i++;
-  } else {
-    i++;
-  }
-
-  let stop = end;
-  for (let s = 0; s < TEXT_STOPS.length; s++) {
-    const idx = src.indexOf(TEXT_STOPS[s], i);
-    if (idx !== -1 && idx < stop) stop = idx;
-  }
-  // scheme:// autolinks stop the run at the scheme's first letter.
-  let j = src.indexOf('://', i);
-  while (j !== -1 && j < stop) {
-    let s = -1;
-    if (j - 4 >= i
-      && (src.charCodeAt(j - 4) | 32) === 104 && (src.charCodeAt(j - 3) | 32) === 116
-      && (src.charCodeAt(j - 2) | 32) === 116 && (src.charCodeAt(j - 1) | 32) === 112) s = j - 4;
-    else if (j - 5 >= i
-      && (src.charCodeAt(j - 5) | 32) === 104 && (src.charCodeAt(j - 4) | 32) === 116
-      && (src.charCodeAt(j - 3) | 32) === 116 && (src.charCodeAt(j - 2) | 32) === 112
-      && (src.charCodeAt(j - 1) | 32) === 115) s = j - 5;
-    else if (j - 3 >= i
-      && (src.charCodeAt(j - 3) | 32) === 102 && (src.charCodeAt(j - 2) | 32) === 116
-      && (src.charCodeAt(j - 1) | 32) === 112) s = j - 3;
-    if (s !== -1) {
-      stop = s;
-      break;
-    }
-    j = src.indexOf('://', j + 1);
-  }
-  // www. autolinks stop the run where they start, when the character
-  // before them is the start of the run, whitespace, *, _, ~ or (.
-  let w = src.indexOf('www.', i);
-  while (w !== -1 && w < stop) {
-    if (w === pos) {
-      stop = w;
-      break;
-    }
-    const p = src[w - 1];
-    if (p === ' ' || p === '\t' || p === '\n' || p === '\r' || p === '*' || p === '_' || p === '~' || p === '(') {
-      stop = w;
-      break;
-    }
-    w = src.indexOf('www.', w + 1);
-  }
-  // An email address stops the run where it starts.
-  let a = src.indexOf('@', i);
-  while (a !== -1 && a < stop) {
-    let e = a;
-    while (e > i && isEmailCharCode(src.charCodeAt(e - 1))) e--;
-    if (e < a && e >= i) {
-      stop = e;
-      break;
-    }
-    a = src.indexOf('@', a + 1);
-  }
-  // A hard break stops the run where its spaces start.
-  let h = src.indexOf('  \n', i);
-  while (h !== -1 && h < stop) {
-    let s = h;
-    while (s > i && src[s - 1] === ' ') s--;
-    stop = s;
-    break;
-  }
-  return stop;
-}
-
 function tokInlineText(st, src, pos, len) {
-  const end = scanTextEnd(src, pos, len);
-  if (end <= pos) return;
-  const raw = src.slice(pos, end);
+  const cap = at(INLINE.text, src, pos);
+  if (!cap) return;
   const escaped = st.inRawBlock;
   return {
     token: {
-      type: 'text', raw,
-      text: escaped ? raw : decodeNumRefs(raw),
+      type: 'text', raw: cap[0],
+      text: escaped ? cap[0] : decodeNumRefs(cap[0]),
       escaped,
     },
-    len: end - pos,
+    len: cap[0].length,
   };
 }
 
